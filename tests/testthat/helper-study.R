@@ -23,7 +23,7 @@ finish_step <- function(store, study, sites, lead) {
     lt <- lead_task(st)
     if (is.null(lt)) return(invisible(st))
     if (!lt$ready) stop("Step cannot continue: ", paste(c(lt$missing, lt$errors), collapse = "; "))
-    out <- advance_step(st, lt$step, step_data(st, lt$step, sites[[lead]]))
+    out <- advance_step(st, lt$step)
     store$write(out$path, out$obj)
   }
 }
@@ -35,11 +35,6 @@ run_step <- function(store, study, sites, lead, step, make_request) {
 }
 
 # Benchmarks (not federated): the same models fitted on all sites' rows at once.
-fit_pooled_logistic <- function(Xs, ys, ridge = 1e-6) {
-  fit <- logistic_mle(do.call(rbind, Xs), unlist(ys), ridge)
-  setNames(fit$beta, colnames(Xs[[1]]))
-}
-
 fit_pooled_pairwise <- function(Xs, ys, weights, ridge = 1e-6) {
   pats <- Map(collapse_patterns, Xs, ys)
   f <- function(b, d) {
@@ -67,11 +62,10 @@ fit_pooled_cox <- function(xy) {
 }
 
 pooled_fit <- function(sites, cutoffs, vars, method, weights) {
-  xy <- lapply(sites, function(s) site_xy(s$train, cutoffs, vars, method == "ODAL2"))
+  xy <- lapply(sites, function(s) site_xy(s$train, cutoffs, vars))
   Xs <- lapply(xy, `[[`, "X")
   ys <- lapply(xy, `[[`, "y")
   switch(method,
-         ODAL2 = fit_pooled_logistic(Xs, ys),
          dCLR = fit_pooled_pairwise(Xs, ys, weights[names(sites)]),
          ODACH = fit_pooled_cox(xy),
          DiSAH = setNames(linying_combine(lapply(xy, function(z) linying_stats(z$X, z$time, z$y)))$beta, colnames(Xs[[1]])))

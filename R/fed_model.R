@@ -1,10 +1,8 @@
 # FedScore Module 3: federated regression ----------------------------------------
 #
 # Binary outcomes:
-#   * ODAL2 (Duan et al., JAMIA 2020) for homogeneous sites. A lead site
-#     combines its own likelihood with gradients/Hessians from every site.
-#   * dCLR (Tong et al., npj Digit Med 2022) for heterogeneous sites. Pairwise
-#     conditional likelihood removes site-specific intercepts (baseline risk).
+#   * dCLR (Tong et al., npj Digit Med 2022). Pairwise conditional likelihood
+#     removes site-specific intercepts, so each site keeps its baseline risk.
 # Survival outcomes:
 #   * ODACH (Luo et al., Sci Rep 2022): Cox model stratified by site, so each
 #     site keeps its own baseline hazard. Same rounds as dCLR.
@@ -17,7 +15,8 @@
 
 # Treatment-coded indicators for categorised data (first level = reference).
 # The `map` attribute links each column back to its variable and category.
-design_matrix <- function(cat_df, intercept = TRUE) {
+# No intercept: every model in the app has site-specific baselines.
+design_matrix <- function(cat_df) {
   cols <- list()
   map <- data.frame(column = character(0), variable = character(0), level = character(0))
   for (v in names(cat_df)) {
@@ -30,10 +29,6 @@ design_matrix <- function(cat_df, intercept = TRUE) {
   }
   X <- do.call(cbind, cols)
   if (is.null(X)) X <- matrix(numeric(0), nrow = nrow(cat_df), ncol = 0)
-  if (intercept) {
-    X <- cbind(`(Intercept)` = 1, X)
-    map <- rbind(data.frame(column = "(Intercept)", variable = "(Intercept)", level = ""), map)
-  }
   attr(X, "map") <- map
   X
 }
@@ -41,20 +36,18 @@ design_matrix <- function(cat_df, intercept = TRUE) {
 # The columns design_matrix() produces for `vars`, worked out from the cut-offs
 # alone (no data needed). The `levels` attribute lists every category,
 # reference first, for building score tables.
-design_terms <- function(cutoffs, vars, intercept = TRUE) {
+design_terms <- function(cutoffs, vars) {
   lv <- lapply(setNames(vars, vars), function(v) var_levels(cutoffs[[v]]))
-  map <- do.call(rbind, c(
-    if (intercept) list(data.frame(column = "(Intercept)", variable = "(Intercept)", level = "")),
-    lapply(vars, function(v) data.frame(column = paste0(v, " ", lv[[v]][-1]), variable = rep(v, length(lv[[v]]) - 1),
-                                        level = lv[[v]][-1]))))
+  map <- do.call(rbind, lapply(vars, function(v)
+    data.frame(column = paste0(v, " ", lv[[v]][-1]), variable = rep(v, length(lv[[v]]) - 1), level = lv[[v]][-1])))
   attr(map, "levels") <- lv
   map
 }
 
 # Categorise one data split and build its design matrix and outcome. For a
 # survival outcome, `y` is the event indicator and `time` the follow-up time.
-site_xy <- function(df, cutoffs, vars, intercept) {
-  X <- design_matrix(categorize(df, cutoffs, vars), intercept)
+site_xy <- function(df, cutoffs, vars) {
+  X <- design_matrix(categorize(df, cutoffs, vars))
   if (data_outcome(df) == "survival") return(list(X = X, y = df$label_status, time = df$label_time))
   list(X = X, y = df$label)
 }
@@ -99,7 +92,8 @@ newton_max <- function(f, beta0, maxit = 50, tol = 1e-7) {
        iterations = it, converged = converged)
 }
 
-# Ordinary logistic likelihood (ODAL2) ----------------------------------------
+# Ordinary logistic likelihood ------------------------------------------------
+# Used for dCLR's starting values and FedIMPUTE's binary imputation models.
 
 # Mean log-likelihood with derivatives; `ridge` keeps the Hessian invertible
 # when a category is empty at a site (the intercept is not penalised).
@@ -120,7 +114,7 @@ logistic_mle <- function(X, y, ridge = 1e-6) {
   newton_max(function(b, d) logistic_lik(b, X, y, d, ridge), beta0)
 }
 
-# Second-order surrogate likelihood shared by ODAL2 and dCLR: a site's own
+# Second-order surrogate likelihood shared by dCLR and ODACH: a site's own
 # likelihood `lik`, corrected towards the all-site likelihood by the gap
 # between the aggregated derivatives `total` and its own derivatives at
 # beta_bar. Maximised by Newton steps from beta_bar.
@@ -147,23 +141,10 @@ aggregate_derivs <- function(derivs, weights) {
        hess = Reduce(`+`, Map(function(d, w) w * d$hess, derivs, weights)))
 }
 
-# ODAL2 pieces. Design matrices include the intercept.
-#   Lead site: odal2_init() gives beta_bar, shared with every site.
-#   Every site: site_derivs("ODAL2", ...) at beta_bar.
-#   Lead site: odal2_surrogate() with the aggregated derivatives; N is the
-#   total training size across sites (for the standard errors).
-odal2_init <- function(X, y, ridge = 1e-6) logistic_mle(X, y, ridge)$beta
-
-odal2_surrogate <- function(X, y, beta_bar, total, N, ridge = 1e-6) {
-  fit <- surrogate_fit(function(b, d) logistic_lik(b, X, y, d, ridge), beta_bar, total)
-  list(beta = fit$beta, se = sqrt(pmax(diag(safe_inv(-N * fit$hess)), 0)), converged = fit$converged)
-}
-
 # Gradient and Hessian of a site's (mean) log-likelihood at `beta`; `xy` comes
 # from site_xy().
 site_derivs <- function(method, beta, xy, ridge = 1e-6) {
   d <- switch(method,
-              ODAL2 = logistic_lik(beta, xy$X, xy$y, TRUE, ridge),
               dCLR = pairwise_lik(beta, collapse_patterns(xy$X, xy$y), TRUE, FALSE, ridge),
               ODACH = cox_lik(beta, xy$X, xy$time, xy$y, TRUE, ridge),
               stop("No derivatives for ", method))
@@ -268,7 +249,7 @@ iv_average <- function(betas, vcovs) {
   list(beta = drop(V %*% Reduce(`+`, Map(function(Pr, b) Pr %*% b, precs, betas))), vcov = V)
 }
 
-# dCLR pieces. Design matrices have no intercept.
+# dCLR pieces.
 #   Every site: dclr_local() gives its estimate and sandwich variance; the
 #   inverse-variance weighted average is beta_bar.
 #   Every site: site_derivs("dCLR", ...) at beta_bar.

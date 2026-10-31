@@ -5,7 +5,6 @@
 # maximum attainable total is `max_score`. `map` comes from design_terms().
 score_table <- function(beta, map, max_score = 100) {
   levels <- attr(map, "levels")
-  map <- map[map$variable != "(Intercept)", ]
   coef <- beta[map$column]
   vars <- names(levels)
   rows <- lapply(vars, function(v) {
@@ -97,13 +96,13 @@ summarise_parsimony <- function(res, weights) {
 # correction fitted on that site's own training data (offset = federated
 # linear predictor), i.e. beta_TL = beta_fed + delta. `beta` is named by the
 # federated model's terms; only the target site's data is used. Available for
-# the logistic models and for Cox (ODACH); not for additive hazards (DiSAH).
-TL_METHODS <- c("ODAL2", "dCLR", "ODACH")
+# dCLR and Cox (ODACH) scores; not for additive hazards (DiSAH).
+TL_METHODS <- c("dCLR", "ODACH")
 
 fit_tlscore <- function(beta, method, vars, site, cutoffs, max_score = 100, seed = 2024, nfolds = 5) {
   if (!method %in% TL_METHODS) stop("TLScore is not available for ", method, " models.")
   cat_df <- categorize(site$train, cutoffs, vars)
-  X <- design_matrix(cat_df, intercept = FALSE)
+  X <- design_matrix(cat_df)
   beta_fed <- beta[colnames(X)]
   eta <- drop(X %*% beta_fed)
   set.seed(seed)
@@ -115,8 +114,8 @@ fit_tlscore <- function(beta, method, vars, site, cutoffs, max_score = 100, seed
     y <- survival::Surv(time, site$train$label_status)
     glmnet::cv.glmnet(X, y, family = "cox", offset = eta, alpha = 1, nfolds = nfolds, maxit = 1e5)
   } else {
-    # Recentre the offset on the site's event rate (dCLR has no intercept, and
-    # ODAL2's comes from other sites); glmnet's own intercept absorbs the rest.
+    # Recentre the offset on the site's event rate (dCLR has no intercept);
+    # glmnet's own intercept absorbs the rest.
     offset <- eta - mean(eta) + stats::qlogis(mean(site$train$label))
     glmnet::cv.glmnet(X, site$train$label, family = "binomial", offset = offset,
                       alpha = 1, nfolds = nfolds, maxit = 1e5)
@@ -127,5 +126,5 @@ fit_tlscore <- function(beta, method, vars, site, cutoffs, max_score = 100, seed
   beta_tl <- beta
   beta_tl[names(delta)] <- beta_fed + delta
   list(beta = beta_tl, delta = delta, lambda = cv$lambda.min,
-       table = score_table(beta_tl, design_terms(cutoffs, vars, method == "ODAL2"), max_score))
+       table = score_table(beta_tl, design_terms(cutoffs, vars), max_score))
 }

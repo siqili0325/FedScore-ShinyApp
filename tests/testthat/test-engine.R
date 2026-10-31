@@ -79,17 +79,17 @@ test_that("logistic derivatives agree with finite differences", {
 test_that("surrogate fits with exact aggregated derivatives reach the pooled optimum", {
   beta <- c(1, -0.8, 0.5)
   a <- sim_binary(3000, 3, beta, intercept = -2, seed = 4)
-  b <- sim_binary(1500, 3, beta, intercept = -0.5, seed = 5)
-  Xs <- list(A = cbind(`(Intercept)` = 1, a$X), B = cbind(`(Intercept)` = 1, b$X))
-  ys <- list(A = a$y, B = b$y)
+  b <- sim_binary(1500, 3, beta, intercept = -0.5, seed = 5)   # different baseline risk
+  xy <- list(A = list(X = a$X, y = a$y), B = list(X = b$X, y = b$y))
   w <- site_weights(c(3000, 1500))
-  # ODAL2 iterated to a fixed point is the size-weighted pooled MLE.
-  bb <- odal2_init(Xs$A, ys$A)
-  for (i in 1:5) {
-    total <- aggregate_derivs(Map(function(X, y) site_derivs("ODAL2", bb, list(X = X, y = y)), Xs, ys), w)
-    bb <- odal2_surrogate(Xs$A, ys$A, bb, total, N = 4500)$beta
+  # Iterating dCLR's surrogate step converges to the weighted pooled pairwise fit.
+  bb <- local_fit("dCLR", xy$A)$beta
+  for (i in 1:4) {
+    total <- aggregate_derivs(lapply(xy, function(z) site_derivs("dCLR", bb, z)), w)
+    bb <- local_surrogate("dCLR", xy$A, bb, total)$beta
   }
-  expect_equal(unname(bb), unname(fit_pooled_logistic(Xs, ys)), tolerance = 1e-5)
+  pooled <- fit_pooled_pairwise(lapply(xy, `[[`, "X"), lapply(xy, `[[`, "y"), w)
+  expect_equal(unname(bb), unname(pooled), tolerance = 1e-5)
 })
 
 test_that("categorisation gives identical levels at every site", {
@@ -113,8 +113,8 @@ test_that("score tables start at 0 per variable and total at most 100", {
   s$label <- rbinom(500, 1, plogis(-1 + s$x - 0.5 * s$z))
   site <- list(train = s[1:300, ], validate = s[301:400, ], test = s[401:500, ])
   cuts <- federate_cutoffs(list(A = site_cut_stats(site$train, c("x", "z"))), 1)
-  xy <- site_xy(site$train, cuts, c("x", "z"), TRUE)
-  beta <- logistic_mle(xy$X, xy$y)$beta
+  xy <- site_xy(site$train, cuts, c("x", "z"))
+  beta <- dclr_local(xy$X, xy$y)$beta
   map <- design_terms(cuts, c("x", "z"))
   expect_identical(map$column, colnames(xy$X))
   tbl <- score_table(beta, map)
@@ -122,7 +122,7 @@ test_that("score tables start at 0 per variable and total at most 100", {
   expect_lte(sum(tapply(tbl$Points, tbl$Variable, max)), 101)
   sc <- compute_scores(s, tbl, cuts)
   expect_gt(auc_only(sc, s$label), 0.65)
-  tl <- fit_tlscore(beta, "ODAL2", c("x", "z"), site, cuts)
+  tl <- fit_tlscore(beta, "dCLR", c("x", "z"), site, cuts)
   expect_equal(nrow(tl$table), nrow(tbl))
 })
 

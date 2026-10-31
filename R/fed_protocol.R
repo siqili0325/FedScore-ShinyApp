@@ -15,7 +15,7 @@ STEPS <- c(summary = "Data summary", impute = "Missing values", rank = "Ranking"
            pars = "Model selection", final = "Final score")
 
 # Federated algorithms for each outcome.
-METHODS <- list(binary = c("ODAL2", "dCLR"), survival = c("ODACH", "DiSAH"))
+METHODS <- list(binary = "dCLR", survival = c("ODACH", "DiSAH"))
 
 study_outcome <- function(state) if (is.null(state$config$outcome)) "binary" else state$config$outcome
 
@@ -194,32 +194,22 @@ cut_request <- function(state, probs = DEFAULT_PROBS) {
 
 # Model fitting for the parsimony analysis (`models` = top 1..m variables,
 # evaluated on the validation sets) or the final score (one model, test sets).
-# ODAL2 starts from the lead site's own estimate, so it needs the lead's data.
 # `times` are the follow-up times for AUC(t) (survival, final score only).
 fit_request <- function(state, models, method, refinements = 1, split = "validate",
-                        max_score = 100, lead_data = NULL, times = NULL) {
+                        max_score = 100, times = NULL) {
   outcome <- study_outcome(state)
   if (!method %in% METHODS[[outcome]])
     stop(sprintf("%s is not available for a %s outcome; choose %s.", method, outcome,
                  paste(METHODS[[outcome]], collapse = " or ")))
   cutoffs <- state$steps$cut$result$cutoffs
-  intercept <- method == "ODAL2"
-  specs <- lapply(models, function(vars) list(vars = vars, terms = design_terms(cutoffs, vars, intercept)$column))
+  specs <- lapply(models, function(vars) list(vars = vars, terms = design_terms(cutoffs, vars)$column))
   min_count <- if (is.null(state$config$min_count)) 0L else state$config$min_count
   base <- list(method = method, outcome = outcome, refinements = refinements, split = split,
                full = split == "test", max_score = max_score, cutoffs = cutoffs,
                weights = as.list(study_weights(state)), min_count = min_count,
                times = if (length(times)) as.numeric(times))
-  if (method %in% c("dCLR", "ODACH")) return(c(list(kind = "local"), base, list(models = specs)))
   if (method == "DiSAH") return(c(list(kind = "linying"), base, list(models = specs)))
-  if (is.null(lead_data)) stop("ODAL2 needs the lead site's data to start.")
-  specs <- lapply(specs, function(m) {
-    check_min_count(lead_data, list(kind = "derivs", cutoffs = cutoffs, min_count = min_count), m$vars)
-    xy <- site_xy(lead_data$train, cutoffs, m$vars, TRUE)
-    b <- unname(odal2_init(xy$X, xy$y))
-    c(m, list(beta = b, init = b))
-  })
-  c(list(kind = "derivs", pass = 1L), base, list(models = specs))
+  c(list(kind = "local"), base, list(models = specs))
 }
 
 # Every site: answering a request -------------------------------------------------
@@ -301,7 +291,7 @@ model_reply <- function(req, m, data) {
     if (isTRUE(req$full)) return(list(metrics = evaluate_scores(score, df$label), roc = roc_points(score, df$label)))
     return(list(n = nrow(df), auc = auc_only(score, df$label)))
   }
-  xy <- site_xy(data$train, req$cutoffs, m$vars, req$method == "ODAL2")
+  xy <- site_xy(data$train, req$cutoffs, m$vars)
   out <- switch(req$kind,
                 local = local_fit(req$method, xy),
                 derivs = c(site_derivs(req$method, m$beta, xy), list(n = length(xy$y))),
@@ -314,7 +304,7 @@ model_reply <- function(req, m, data) {
 
 # Combine the replies to the last round of `step` into the next request or
 # the step's result. Returns list(path, obj) for the lead to write.
-advance_step <- function(state, step, lead_data = NULL) {
+advance_step <- function(state, step) {
   study <- state$config$study
   rounds <- state$steps[[step]]$rounds
   k <- length(rounds)
@@ -325,7 +315,7 @@ advance_step <- function(state, step, lead_data = NULL) {
                 impute = advance_impute(req, replies),
                 rank = rank_result(replies, study_weights(state)),
                 cut = cut_result(replies, study_weights(state)),
-                pars = , final = advance_fit(req, replies, lead_data))
+                pars = , final = advance_fit(req, replies))
   if (!is.null(out$kind)) {
     out <- c(list(id = new_id(step), step_id = req$step_id, step = step, round = k + 1L,
                   from = req$from, created = now_utc()), out)
@@ -426,10 +416,9 @@ cut_result <- function(replies, weights) {
   list(cutoffs = cutoffs, auto = cutoffs)
 }
 
-# The fitting rounds. ODAL2: derivs -> (lead fits) -> evaluate. dCLR and
-# ODACH: local -> derivs -> surrogate (-> derivs -> surrogate ...) -> evaluate.
-# DiSAH: linying -> evaluate.
-advance_fit <- function(req, replies, lead_data) {
+# The fitting rounds. dCLR and ODACH: local -> derivs -> surrogate (-> derivs
+# -> surrogate ...) -> evaluate. DiSAH: linying -> evaluate.
+advance_fit <- function(req, replies) {
   w <- unlist(req$weights)[names(replies)]
   M <- length(req$models)
   answers <- function(m) lapply(replies, function(r) r$models[[m]])
@@ -440,7 +429,7 @@ advance_fit <- function(req, replies, lead_data) {
   # Score table of each model, ready for the sites to evaluate.
   evaluate <- function(models) {
     models <- lapply(models, function(m) {
-      map <- design_terms(req$cutoffs, m$vars, req$method == "ODAL2")
+      map <- design_terms(req$cutoffs, m$vars)
       c(m, list(table = score_table(setNames(m$beta, m$terms), map, req$max_score)))
     })
     list(kind = "evaluate", models = models)
@@ -457,19 +446,8 @@ advance_fit <- function(req, replies, lead_data) {
     derivs = {
       totals <- lapply(seq_len(M), function(m)
         aggregate_derivs(lapply(answers(m), function(x) list(grad = x$grad, hess = as.matrix(x$hess))), w))
-      if (req$method == "ODAL2") {
-        if (is.null(lead_data)) stop("The lead site's data is needed to finish ODAL2.")
-        N <- sum(vapply(replies, function(r) as.numeric(r$models[[1]]$n), numeric(1)))
-        carry(evaluate(lapply(seq_len(M), function(m) {
-          spec <- req$models[[m]]
-          xy <- site_xy(lead_data$train, req$cutoffs, spec$vars, TRUE)
-          fit <- odal2_surrogate(xy$X, xy$y, spec$beta, totals[[m]], N)
-          keep(m, beta = unname(fit$beta), se = unname(fit$se), converged = fit$converged)
-        })))
-      } else {
-        carry(list(kind = "surrogate", pass = req$pass, models = lapply(seq_len(M), function(m)
-          keep(m, beta = req$models[[m]]$beta, grad = totals[[m]]$grad, hess = totals[[m]]$hess))))
-      }
+      carry(list(kind = "surrogate", pass = req$pass, models = lapply(seq_len(M), function(m)
+        keep(m, beta = req$models[[m]]$beta, grad = totals[[m]]$grad, hess = totals[[m]]$hess))))
     },
     surrogate = {
       ests <- lapply(seq_len(M), function(m) {

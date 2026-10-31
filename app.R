@@ -24,8 +24,7 @@ DEMO_CHOICES <- c("(none)" = "", "Binary outcome, site 1" = "site1", "Binary out
                   "Binary, with missing values, site 2" = "missing_site2")
 
 ALGORITHMS <- list(
-  binary = c("ODAL2: homogeneous sites" = "ODAL2",
-             "dCLR: heterogeneous sites (site-specific baseline risk)" = "dCLR"),
+  binary = c("dCLR: logistic model, site-specific baseline risk" = "dCLR"),
   survival = c("ODACH: Cox model, site-specific baseline hazards" = "ODACH",
                "DiSAH: additive hazards, site-specific baseline hazards (one round)" = "DiSAH"))
 RANK_METHODS <- list(
@@ -122,7 +121,7 @@ FedScore builds an [AutoScore](https://github.com/nliulab/AutoScore)-style point
 
 To try it on one computer, connect two browser tabs to the same folder: one as `site1` with a site-1 demo, which creates the study, and one as `site2` with the matching site-2 demo.
 
-Steps: **missing values** (optional: FedIMPUTE federates imputation models; each site fills its own gaps) → **ranking** (each site ranks variables) → **cut-offs** (each site shares quantiles) → **model selection** (federated regression for the top 1…m variables: ODAL2 or dCLR for a binary outcome, ODACH or DiSAH for survival) → **final score** (points table, evaluated at every site) → **TLScore** (optional, local only). Every file exchanged is listed under **Exchange log**.
+Steps: **missing values** (optional: FedIMPUTE federates imputation models; each site fills its own gaps) → **ranking** (each site ranks variables) → **cut-offs** (each site shares quantiles) → **model selection** (federated regression for the top 1…m variables: dCLR for a binary outcome, ODACH or DiSAH for survival) → **final score** (points table, evaluated at every site) → **TLScore** (optional, local only). Every file exchanged is listed under **Exchange log**.
 "))
     )
   ),
@@ -255,7 +254,7 @@ Steps: **missing values** (optional: FedIMPUTE federates imputation models; each
         actionButton("run_tl", "Fit TLScore for your site", class = "btn-primary w-100"),
         p(class = "shared-note mt-2", "Runs only on your computer and shares nothing. A lasso correction",
           "δ is fitted on your training data with the federated linear predictor as offset, giving",
-          "β_TL = β_fed + δ. Available for ODAL2, dCLR and ODACH models.")
+          "β_TL = β_fed + δ. Available for dCLR and ODACH models.")
       ),
       card(card_header("Test performance at your site"), tableOutput("tl_perf")),
       card(full_screen = TRUE, card_header("FedScore vs. TLScore points"), tableOutput("tl_tbl"),
@@ -429,7 +428,7 @@ server <- function(input, output, session) {
     if (is.null(lt) || !lt$ready || (auto && key %in% handled)) return(FALSE)
     handled <<- c(handled, key)
     ok <- run_safely(withProgress(message = sprintf("%s: combining replies", STEPS[[lt$step]]), value = 0.5, {
-      out <- advance_step(st, lt$step, step_data(st, lt$step, rv$data))
+      out <- advance_step(st, lt$step)
       rv$store$write(out$path, out$obj)
       TRUE
     }))
@@ -749,7 +748,7 @@ server <- function(input, output, session) {
     guard(!is.null(results$rank), "Finish Ranking first.")
     vars <- head(ranking()$Variable, input$max_vars)
     start("pars", function(st) fit_request(st, lapply(seq_along(vars), function(m) vars[seq_len(m)]),
-                                           input$method, input$refine, "validate", 100, step_data(st, "pars", rv$data)),
+                                           input$method, input$refine, "validate", 100),
           c("rank", "cut"))
   })
 
@@ -810,7 +809,7 @@ server <- function(input, output, session) {
       guard(length(times) > 0, "Enter the times for AUC(t), or load your data so the app can choose them.")
     }
     start("final", function(st) fit_request(st, list(vars), input$method, input$refine, "test", input$max_score,
-                                            step_data(st, "final", rv$data), times), c("rank", "cut"))
+                                            times = times), c("rank", "cut"))
   })
 
   final <- reactive({
@@ -872,7 +871,7 @@ server <- function(input, output, session) {
                     "Federated (log odds ratio)")
     out <- data.frame(Term = f$terms, Federated = f$beta, SE = f$se, check.names = FALSE)
     names(out)[2] <- scale
-    if (length(f$init)) out[[if (f$method == "ODAL2") "Initial (lead site)" else "Initial (round 1 average)"]] <- f$init
+    if (length(f$init)) out[["Initial (round 1 average)"]] <- f$init
     out
   }, digits = 4)
 
@@ -897,7 +896,7 @@ server <- function(input, output, session) {
     guard(!is.null(results$final), "The final score (step 6) is not ready yet.")
     guard(!is.null(rv$data), "Load your data on the Study tab first.")
     f <- results$final
-    guard(f$method %in% TL_METHODS, sprintf("TLScore needs a Cox (ODACH) or logistic model; this score uses %s.", f$method))
+    guard(f$method %in% TL_METHODS, sprintf("TLScore needs a dCLR or ODACH model; this score uses %s.", f$method))
     d <- my_data()
     rv$tl <- run_safely(withProgress(message = "Fitting TLScore", value = .5, {
       tl <- fit_tlscore(setNames(f$beta, f$terms), f$method, f$vars, d, f$cutoffs, f$max_score)
@@ -914,7 +913,7 @@ server <- function(input, output, session) {
 
   output$tl_perf <- renderTable({
     validate(need(is.null(results$final) || results$final$method %in% TL_METHODS,
-                  "TLScore is not available for additive-hazards (DiSAH) scores; it needs a logistic or Cox model."))
+                  "TLScore is not available for additive-hazards (DiSAH) scores; it needs a dCLR or ODACH model."))
     validate(need(rv$tl, "When the final score is ready, fit TLScore for your site."))
     p <- rv$tl$perf
     adjusted <- c("", sprintf("%d of %d", sum(rv$tl$delta != 0), length(rv$tl$delta)))
