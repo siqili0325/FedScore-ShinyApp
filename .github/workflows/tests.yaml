@@ -1,0 +1,35 @@
+# Run the app's tests on every push and pull request.
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+          use-public-rspm: true
+
+      - name: Install packages
+        run: |
+          install.packages(c("shiny", "bslib", "ggplot2", "AutoScore", "pROC", "glmnet",
+                             "jsonlite", "httr2", "testthat"))
+        shell: Rscript {0}
+
+      - name: Run tests
+        run: |
+          res <- as.data.frame(testthat::test_dir("tests/testthat", reporter = "summary",
+                                                  stop_on_failure = TRUE))
+          cat(sum(res$nb), "expectations,", sum(res$failed), "failed\n")
+        shell: Rscript {0}
