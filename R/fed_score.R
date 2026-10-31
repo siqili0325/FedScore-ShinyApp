@@ -58,6 +58,33 @@ roc_points <- function(score, label) {
   list(fpr = (1 - r$specificities)[o], tpr = r$sensitivities[o])
 }
 
+# Survival outcomes (as AutoScore-Survival) -------------------------------------
+
+# Integrated AUC: Uno's time-dependent AUC at each event time, weighted by the
+# drop in the Kaplan-Meier curve (AutoScore's eva_performance_iauc).
+surv_iauc <- function(score, time, status) {
+  y <- survival::Surv(time, status)
+  km <- summary(survival::survfit(y ~ 1))
+  keep <- seq_len(max(0, length(km$time) - 1))
+  if (length(keep) < 1) return(NA_real_)
+  auc <- survAUC::AUC.uno(y, y, lpnew = score, times = km$time[keep])$auc
+  drop <- c(1, km$surv[keep][-length(keep)]) - km$surv[keep]
+  sum(drop / sum(drop) * auc)
+}
+
+# iAUC, Harrell's C-index with a 95% CI, and AUC(t) at `times`.
+evaluate_survival <- function(score, time, status, times) {
+  y <- survival::Surv(time, status)
+  cf <- survival::concordancefit(y, -score)
+  se <- sqrt(cf$var[1])
+  times <- times[times < max(time[status == 1])]
+  auc_t <- if (length(times)) survAUC::AUC.uno(y, y, lpnew = score, times = times)$auc else numeric(0)
+  list(metrics = data.frame(N = length(time), Events = sum(status), iAUC = surv_iauc(score, time, status),
+                            C_index = cf$concordance, Lower = cf$concordance - 1.96 * se,
+                            Upper = cf$concordance + 1.96 * se),
+       auc_t = list(time = times, auc = auc_t))
+}
+
 # Mean validation AUC across sites, weighted by the site weights.
 summarise_parsimony <- function(res, weights) {
   w <- weights[res$Site]
@@ -69,19 +96,33 @@ summarise_parsimony <- function(res, weights) {
 # TLScore: adapt the federated model to one target site with a lasso-penalised
 # correction fitted on that site's own training data (offset = federated
 # linear predictor), i.e. beta_TL = beta_fed + delta. `beta` is named by the
-# federated model's terms; only the target site's data is used.
+# federated model's terms; only the target site's data is used. Available for
+# the logistic models and for Cox (ODACH); not for additive hazards (DiSAH).
+TL_METHODS <- c("ODAL2", "dCLR", "ODACH")
+
 fit_tlscore <- function(beta, method, vars, site, cutoffs, max_score = 100, seed = 2024, nfolds = 5) {
+  if (!method %in% TL_METHODS) stop("TLScore is not available for ", method, " models.")
   cat_df <- categorize(site$train, cutoffs, vars)
   X <- design_matrix(cat_df, intercept = FALSE)
   beta_fed <- beta[colnames(X)]
   eta <- drop(X %*% beta_fed)
-  # Recentre the offset on the site's event rate (dCLR has no intercept, and
-  # ODAL2's comes from other sites); glmnet's own intercept absorbs the rest.
-  offset <- eta - mean(eta) + stats::qlogis(mean(site$train$label))
   set.seed(seed)
-  cv <- glmnet::cv.glmnet(X, site$train$label, family = "binomial", offset = offset,
-                          alpha = 1, nfolds = nfolds, maxit = 1e5)
-  delta <- as.numeric(stats::coef(cv, s = "lambda.min"))[-1]
+  cv <- if (method == "ODACH") {
+    # glmnet's Cox model rejects zero times; move them just above zero
+    # (their order relative to the other times is unchanged).
+    time <- site$train$label_time
+    time[time <= 0] <- min(time[time > 0]) / 2
+    y <- survival::Surv(time, site$train$label_status)
+    glmnet::cv.glmnet(X, y, family = "cox", offset = eta, alpha = 1, nfolds = nfolds, maxit = 1e5)
+  } else {
+    # Recentre the offset on the site's event rate (dCLR has no intercept, and
+    # ODAL2's comes from other sites); glmnet's own intercept absorbs the rest.
+    offset <- eta - mean(eta) + stats::qlogis(mean(site$train$label))
+    glmnet::cv.glmnet(X, site$train$label, family = "binomial", offset = offset,
+                      alpha = 1, nfolds = nfolds, maxit = 1e5)
+  }
+  delta <- as.numeric(stats::coef(cv, s = "lambda.min"))
+  if (method != "ODACH") delta <- delta[-1]           # drop glmnet's intercept
   names(delta) <- colnames(X)
   beta_tl <- beta
   beta_tl[names(delta)] <- beta_fed + delta

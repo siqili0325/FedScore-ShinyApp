@@ -1,10 +1,15 @@
-# FedScore Module 3: federated logistic regression ----------------------------
+# FedScore Module 3: federated regression ----------------------------------------
 #
-# Two algorithms are available:
+# Binary outcomes:
 #   * ODAL2 (Duan et al., JAMIA 2020) for homogeneous sites. A lead site
 #     combines its own likelihood with gradients/Hessians from every site.
 #   * dCLR (Tong et al., npj Digit Med 2022) for heterogeneous sites. Pairwise
 #     conditional likelihood removes site-specific intercepts (baseline risk).
+# Survival outcomes:
+#   * ODACH (Luo et al., Sci Rep 2022): Cox model stratified by site, so each
+#     site keeps its own baseline hazard. Same rounds as dCLR.
+#   * DiSAH (Wang et al., arXiv:2601.14609): additive hazards model stratified
+#     by site, fitted exactly from one round of summed estimating equations.
 # This file holds the computations; fed_protocol.R decides which site runs
 # which piece and what is exchanged.
 
@@ -46,9 +51,12 @@ design_terms <- function(cutoffs, vars, intercept = TRUE) {
   map
 }
 
-# Categorise one data split and build its design matrix and outcome.
+# Categorise one data split and build its design matrix and outcome. For a
+# survival outcome, `y` is the event indicator and `time` the follow-up time.
 site_xy <- function(df, cutoffs, vars, intercept) {
-  list(X = design_matrix(categorize(df, cutoffs, vars), intercept), y = df$label)
+  X <- design_matrix(categorize(df, cutoffs, vars), intercept)
+  if (data_outcome(df) == "survival") return(list(X = X, y = df$label_status, time = df$label_time))
+  list(X = X, y = df$label)
 }
 
 # Optimiser -------------------------------------------------------------------
@@ -151,11 +159,28 @@ odal2_surrogate <- function(X, y, beta_bar, total, N, ridge = 1e-6) {
   list(beta = fit$beta, se = sqrt(pmax(diag(safe_inv(-N * fit$hess)), 0)), converged = fit$converged)
 }
 
-# Gradient and Hessian of a site's (mean) log-likelihood at `beta`.
-site_derivs <- function(method, beta, X, y, ridge = 1e-6) {
-  d <- if (method == "ODAL2") logistic_lik(beta, X, y, TRUE, ridge) else
-    pairwise_lik(beta, collapse_patterns(X, y), TRUE, FALSE, ridge)
+# Gradient and Hessian of a site's (mean) log-likelihood at `beta`; `xy` comes
+# from site_xy().
+site_derivs <- function(method, beta, xy, ridge = 1e-6) {
+  d <- switch(method,
+              ODAL2 = logistic_lik(beta, xy$X, xy$y, TRUE, ridge),
+              dCLR = pairwise_lik(beta, collapse_patterns(xy$X, xy$y), TRUE, FALSE, ridge),
+              ODACH = cox_lik(beta, xy$X, xy$time, xy$y, TRUE, ridge),
+              stop("No derivatives for ", method))
   list(grad = d$grad, hess = d$hess)
+}
+
+# Round 1 of dCLR and ODACH: a site's own estimate and its variance.
+local_fit <- function(method, xy) {
+  switch(method, dCLR = dclr_local(xy$X, xy$y), ODACH = cox_local(xy$X, xy$time, xy$y),
+         stop("No local fit for ", method))
+}
+
+# A site's surrogate estimate given the aggregated derivatives at beta_bar.
+local_surrogate <- function(method, xy, beta_bar, total) {
+  switch(method, dCLR = dclr_surrogate(xy$X, xy$y, beta_bar, total),
+         ODACH = cox_surrogate(xy$X, xy$time, xy$y, beta_bar, total),
+         stop("No surrogate fit for ", method))
 }
 
 # Pairwise conditional likelihood (dCLR) ----------------------------------------
@@ -264,4 +289,85 @@ dclr_surrogate <- function(X, y, beta_bar, total, ridge = 1e-6) {
   pat <- collapse_patterns(X, y)
   fit <- surrogate_fit(function(b, d) pairwise_lik(b, pat, d, FALSE, ridge), beta_bar, total)
   list(beta = fit$beta, vcov = pairwise_lik(fit$beta, pat, TRUE, TRUE, ridge)$vcov, converged = fit$converged)
+}
+
+# Cox partial likelihood (ODACH) ------------------------------------------------
+#
+# Mean (over patients) Breslow partial log-likelihood with exact derivatives,
+# computed with cumulative sums over the sorted follow-up times. Each site uses
+# only its own risk sets, which is what stratifying by site means.
+cox_lik <- function(beta, X, time, status, deriv = TRUE, ridge = 1e-6) {
+  n <- length(time)
+  o <- order(time)
+  X <- X[o, , drop = FALSE]
+  time <- time[o]
+  status <- status[o]
+  eta <- drop(X %*% beta)
+  shift <- max(eta)
+  w <- exp(eta - shift)
+  first <- match(time, time)                         # risk set of a tie group starts here
+  last <- n + 1 - match(time, rev(time))             # ... and the group ends here
+  rcum <- function(x) rev(cumsum(rev(x)))
+  S0 <- rcum(w)[first]
+  ev <- status == 1
+  out <- list(value = sum(eta[ev] - log(S0[ev]) - shift) / n - ridge * sum(beta^2) / 2)
+  if (!deriv) return(out)
+  S1 <- apply(X * w, 2, rcum)
+  M <- S1[first, , drop = FALSE] / S0                # weighted mean covariate of each risk set
+  out$grad <- colSums(X[ev, , drop = FALSE] - M[ev, , drop = FALSE]) / n - ridge * beta
+  # sum over events i of S2(t_i) / S0(t_i) = sum_j w_j x_j x_j' c_j, with c_j the
+  # sum of 1 / S0 over events at or before t_j.
+  c_j <- cumsum(ifelse(ev, 1 / S0, 0))[last]
+  out$hess <- -(crossprod(X * (w * c_j), X) - crossprod(M[ev, , drop = FALSE])) / n - diag(ridge, length(beta))
+  out
+}
+
+cox_mle <- function(X, time, status, ridge = 1e-6) {
+  newton_max(function(b, d) cox_lik(b, X, time, status, d, ridge), rep(0, ncol(X)))
+}
+
+cox_local <- function(X, time, status, ridge = 1e-6) {
+  fit <- cox_mle(X, time, status, ridge)
+  list(beta = fit$beta, vcov = safe_inv(-length(time) * fit$hess))
+}
+
+cox_surrogate <- function(X, time, status, beta_bar, total, ridge = 1e-6) {
+  lik <- function(b, d) cox_lik(b, X, time, status, d, ridge)
+  fit <- surrogate_fit(lik, beta_bar, total)
+  list(beta = fit$beta, vcov = safe_inv(-length(time) * lik(fit$beta, TRUE)$hess), converged = fit$converged)
+}
+
+# Additive hazards (DiSAH) --------------------------------------------------------
+#
+# Lin & Ying's estimating equation for the additive hazards model
+# lambda(t | x) = lambda_k(t) + x' beta at site k. A site shares the sums
+#   A = sum_i int (x_i - xbar(t))^2 Y_i(t) dt,  d = sum_i delta_i (x_i - xbar(t_i)),
+#   B = sum_i delta_i (x_i - xbar(t_i))^2,
+# with xbar(t) the mean covariate of its own risk set at t. Summing over sites
+# gives the stratified estimate beta = A^-1 d exactly, with sandwich variance
+# A^-1 B A^-1 / N (all scaled by 1/N). Matches V_k() in the DiSAH code, but
+# uses closed forms instead of loops over patients.
+linying_stats <- function(X, time, status) {
+  n <- length(time)
+  ut <- sort(unique(time))
+  at_risk <- rev(cumsum(rev(tabulate(match(time, ut), length(ut)))))
+  S1 <- apply(X, 2, function(x) rev(cumsum(rev(rowsum(x, match(time, ut), reorder = TRUE)[, 1]))))
+  S1 <- matrix(S1, nrow = length(ut))
+  xbar <- S1 / at_risk
+  gap <- diff(c(0, ut))
+  # int over [0, t_i] of (x_i - xbar(t))^2 dt, summed over patients.
+  A <- crossprod(X * time, X) - crossprod(S1 * sqrt(gap / at_risk))
+  R <- X - xbar[match(time, ut), , drop = FALSE]
+  ev <- status == 1
+  list(A = A, d = colSums(R[ev, , drop = FALSE]), B = crossprod(R[ev, , drop = FALSE]), n = n)
+}
+
+# Combine the sites' sums into the DiSAH estimate.
+linying_combine <- function(stats) {
+  N <- sum(vapply(stats, function(s) as.numeric(s$n), numeric(1)))
+  A <- Reduce(`+`, lapply(stats, function(s) as.matrix(s$A))) / N
+  d <- Reduce(`+`, lapply(stats, function(s) s$d)) / N
+  B <- Reduce(`+`, lapply(stats, function(s) as.matrix(s$B))) / N
+  A_inv <- safe_inv(A)
+  list(beta = drop(A_inv %*% d), se = sqrt(pmax(diag(A_inv %*% B %*% A_inv) / N, 0)))
 }

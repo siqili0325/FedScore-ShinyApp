@@ -1,8 +1,9 @@
 # Loading and validating site data -------------------------------------------
 #
-# Each site is a list with `train`, `validate` and `test` data frames that share
-# a binary `label` column. A single data frame is also accepted and is split
-# 70/10/20 at load time.
+# Each site is a list with `train`, `validate` and `test` data frames. The
+# outcome is either binary (a `label` column) or survival (`label_time` and
+# `label_status` columns, as in AutoScore-Survival). A single data frame is
+# also accepted and is split 70/10/20 at load time.
 
 SPLIT_ALIASES <- list(
   train    = c("train", "train_set", "training"),
@@ -10,27 +11,51 @@ SPLIT_ALIASES <- list(
   test     = c("test", "test_set", "testing")
 )
 
+OUTCOME_COLUMNS <- c("label", "label_time", "label_status")
+
+# "survival" when the data has label_time and label_status, "binary" when it
+# has label.
+data_outcome <- function(df) {
+  if (all(c("label_time", "label_status") %in% names(df))) return("survival")
+  if ("label" %in% names(df)) return("binary")
+  stop("Expected a binary `label` column, or `label_time` and `label_status` columns for a survival outcome.")
+}
+
+predictor_names <- function(df) setdiff(names(df), OUTCOME_COLUMNS)
+
+# 0/1 event indicator of a split: the binary label or the survival status.
+event_indicator <- function(df) if ("label_status" %in% names(df)) df$label_status else df$label
+
 # Coerce a label vector (logical, factor, character or numeric) to integer 0/1.
-as_binary_label <- function(x) {
+as_binary_label <- function(x, name = "label") {
   if (is.logical(x)) return(as.integer(x))
   if (is.factor(x) || is.character(x)) {
     lv <- if (is.factor(x)) levels(droplevels(as.factor(x))) else sort(unique(na.omit(x)))
-    if (length(lv) != 2) stop("`label` must have exactly two classes, found ", length(lv), ".")
+    if (length(lv) != 2) stop("`", name, "` must have exactly two classes, found ", length(lv), ".")
     positive <- if (all(lv %in% c("0", "1"))) "1" else if (all(toupper(lv) %in% c("FALSE", "TRUE"))) lv[toupper(lv) == "TRUE"] else lv[2]
     return(as.integer(as.character(x) == positive))
   }
   vals <- sort(unique(na.omit(x)))
-  if (!all(vals %in% c(0, 1))) stop("Numeric `label` must be coded 0/1.")
+  if (!all(vals %in% c(0, 1))) stop("Numeric `", name, "` must be coded 0/1.")
   as.integer(x)
 }
 
-clean_split <- function(df, split_name) {
+clean_split <- function(df, split_name, outcome) {
   if (!is.data.frame(df)) stop("`", split_name, "` is not a data frame.")
   df <- as.data.frame(df)
-  if (!"label" %in% names(df)) stop("`", split_name, "` has no `label` column.")
-  df$label <- as_binary_label(df$label)
-  if (anyNA(df$label)) stop("`label` in `", split_name, "` contains missing values.")
-  for (v in setdiff(names(df), "label")) {
+  if (data_outcome(df) != outcome) stop("`", split_name, "` does not have the same outcome columns as the training set.")
+  if (outcome == "binary") {
+    df$label <- as_binary_label(df$label)
+    if (anyNA(df$label)) stop("`label` in `", split_name, "` contains missing values.")
+  } else {
+    df$label_status <- as_binary_label(df$label_status, "label_status")
+    df$label_time <- suppressWarnings(as.numeric(df$label_time))
+    if (anyNA(df$label_status) || anyNA(df$label_time))
+      stop("`label_time` or `label_status` in `", split_name, "` contains missing or non-numeric values.")
+    if (any(df$label_time < 0)) stop("`label_time` in `", split_name, "` must not be negative.")
+    df$label <- NULL
+  }
+  for (v in predictor_names(df)) {
     if (is.character(df[[v]]) || is.logical(df[[v]])) df[[v]] <- factor(df[[v]])
   }
   df
@@ -42,55 +67,24 @@ split_site_data <- function(df, ratio = c(0.7, 0.1, 0.2), seed = 1234) {
   lapply(c(train = "train", validate = "validate", test = "test"), function(s) df[idx == s, , drop = FALSE])
 }
 
-# Normalise any supported object into list(train, validate, test).
+# Normalise any supported object into list(train, validate, test). The
+# outcome type is stored as attribute "outcome".
 normalize_site_data <- function(obj, seed = 1234) {
   if (is.list(obj) && !is.data.frame(obj) && !is.null(obj$non_cv)) obj <- obj$non_cv
   if (is.data.frame(obj)) obj <- split_site_data(obj, seed = seed)
   if (!is.list(obj)) stop("Expected a list of data frames or a single data frame.")
-  out <- lapply(names(SPLIT_ALIASES), function(s) {
-    hit <- intersect(SPLIT_ALIASES[[s]], names(obj))
-    if (length(hit) == 0) stop("Missing the `", s, "` split (accepted names: ",
-                               paste(SPLIT_ALIASES[[s]], collapse = ", "), ").")
-    clean_split(obj[[hit[1]]], s)
-  })
+  hits <- lapply(SPLIT_ALIASES, function(a) intersect(a, names(obj)))
+  missing <- names(hits)[lengths(hits) == 0]
+  if (length(missing)) stop("Missing the `", missing[1], "` split (accepted names: ",
+                            paste(SPLIT_ALIASES[[missing[1]]], collapse = ", "), ").")
+  if (!is.data.frame(obj[[hits$train[1]]])) stop("`train` is not a data frame.")
+  outcome <- data_outcome(obj[[hits$train[1]]])
+  out <- lapply(names(SPLIT_ALIASES), function(s) clean_split(obj[[hits[[s]][1]]], s, outcome))
   names(out) <- names(SPLIT_ALIASES)
+  attr(out, "outcome") <- outcome
   out
 }
 
 read_site_file <- function(path, seed = 1234) {
   normalize_site_data(readRDS(path), seed = seed)
-}
-
-# Check that sites can be federated: shared predictors, both classes present.
-# Returns a list of character vectors: `errors` block the analysis, `warnings` do not.
-check_sites <- function(sites) {
-  errors <- character(0)
-  warnings <- character(0)
-  if (length(sites) < 2) errors <- c(errors, "Select at least two sites.")
-  preds <- lapply(sites, function(s) setdiff(names(s$train), "label"))
-  common <- Reduce(intersect, preds)
-  if (length(common) == 0) errors <- c(errors, "The sites share no predictor columns.")
-  for (nm in names(sites)) {
-    extra <- setdiff(preds[[nm]], common)
-    if (length(extra)) warnings <- c(warnings, sprintf("%s: ignoring columns not present at every site (%s).",
-                                                       nm, paste(extra, collapse = ", ")))
-    for (s in names(SPLIT_ALIASES)) {
-      if (length(unique(sites[[nm]][[s]]$label)) < 2)
-        errors <- c(errors, sprintf("%s: the %s set needs both outcome classes.", nm, s))
-    }
-  }
-  list(errors = errors, warnings = warnings, predictors = common)
-}
-
-site_summary <- function(sites) {
-  do.call(rbind, lapply(names(sites), function(nm) {
-    s <- sites[[nm]]
-    data.frame(
-      Site = nm,
-      Train = nrow(s$train), Validation = nrow(s$validate), Test = nrow(s$test),
-      Predictors = ncol(s$train) - 1,
-      `Event rate (train)` = sprintf("%.1f%%", 100 * mean(s$train$label)),
-      check.names = FALSE
-    )
-  }))
 }
