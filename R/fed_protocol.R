@@ -11,8 +11,13 @@
 # its step run (`step_id`), so files left over from an earlier run are ignored.
 
 PROTOCOL_VERSION <- 1L
-STEPS <- c(summary = "Data summary", rank = "Ranking", cut = "Cut-offs",
+STEPS <- c(summary = "Data summary", impute = "Missing values", rank = "Ranking", cut = "Cut-offs",
            pars = "Model selection", final = "Final score")
+
+# Federated algorithms for each outcome.
+METHODS <- list(binary = c("ODAL2", "dCLR"), survival = c("ODACH", "DiSAH"))
+
+study_outcome <- function(state) if (is.null(state$config$outcome)) "binary" else state$config$outcome
 
 now_utc <- function() format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 new_id <- function(step) paste0(step, "-", format(Sys.time(), "%Y%m%dT%H%M%OS6", tz = "UTC"))
@@ -25,13 +30,19 @@ round_file <- function(study, step, k, site = NULL) {
 # What each kind of request asks sites to share (shown in the app).
 shared_content <- function(req) {
   switch(req$kind,
-         summary = "sample sizes, event counts and predictor names",
+         summary = "sample sizes, event counts, predictor names and types, and missing-value counts",
+         impute_local = "local coefficients of each imputation model",
+         impute_derivs = "gradient and Hessian of each imputation model at the broadcast coefficients",
+         linying = "summed additive-hazards estimating equations (A, d, B), for each model",
          rank = "rank position of each variable",
          cut = "quantiles of each continuous variable and the levels of categorical ones",
          local = "local estimate and its variance, for each model",
          derivs = "gradient and Hessian at the broadcast estimate, for each model",
          surrogate = "surrogate estimate and its variance, for each model",
-         evaluate = if (isTRUE(req$full)) "test-set AUC with CI, operating point and ROC curve"
+         evaluate = if (identical(req$outcome, "survival")) {
+                      if (isTRUE(req$full)) "test-set iAUC, C-index with CI, and AUC at the chosen times"
+                      else "validation iAUC of each model"
+                    } else if (isTRUE(req$full)) "test-set AUC with CI, operating point and ROC curve"
                     else "validation AUC of each model",
          req$kind)
 }
@@ -102,6 +113,14 @@ lead_task <- function(state) {
        errors = vapply(errors, `[[`, "", "error"), ready = !length(missing) && !length(errors))
 }
 
+# The data a site works with in `step`: its own data as loaded for the data
+# summary and the imputation rounds; afterwards, if the study imputed missing
+# values, the data completed with the federated imputation models.
+step_data <- function(state, step, data) {
+  res <- state$steps$impute$result
+  if (is.null(data) || step %in% c("summary", "impute") || is.null(res)) data else apply_imputation(data, res)
+}
+
 study_weights <- function(state) {
   w <- unlist(state$steps$summary$result$weights)
   w[state$config$sites]
@@ -111,7 +130,9 @@ study_weights <- function(state) {
 
 # `min_count`: the smallest number of patients a site may share statistics
 # about (see check_min_count); 0 switches the check off.
-create_study <- function(store, study, lead, sites, weighting = "size", min_count = 10) {
+create_study <- function(store, study, lead, sites, weighting = "size", min_count = 10,
+                         outcome = c("binary", "survival")) {
+  outcome <- match.arg(outcome)
   if (!valid_name(study)) stop("Study names may contain only letters, digits, '-' and '_'.")
   bad <- sites[!vapply(sites, valid_name, logical(1))]
   if (length(bad)) stop("Invalid site name(s): ", paste(bad, collapse = ", "))
@@ -121,9 +142,13 @@ create_study <- function(store, study, lead, sites, weighting = "size", min_coun
   if (!is.numeric(min_count) || length(min_count) != 1 || is.na(min_count) || min_count < 0)
     stop("The minimum count must be a number of at least 0.")
   store$write(study_file(study, "study.json"),
-              list(protocol = PROTOCOL_VERSION, study = study, lead = lead, sites = sites,
+              list(protocol = PROTOCOL_VERSION, study = study, lead = lead, sites = sites, outcome = outcome,
                    min_count = as.integer(min_count), created = now_utc()))
-  start_step(store, study, character(0), "summary", list(kind = "summary", weighting = weighting), lead)
+  start_step(store, study, character(0), "summary", summary_request(outcome, weighting), lead)
+}
+
+summary_request <- function(outcome, weighting = "size") {
+  list(kind = "summary", outcome = outcome, weighting = weighting)
 }
 
 # Write round 1 of `step`, first removing every file of this step and the
@@ -141,6 +166,23 @@ start_step <- function(store, study, paths, step, request, lead) {
 }
 
 # Round-1 request of each step, built from the earlier results.
+
+# FedIMPUTE: `vars` are the predictors to impute (see impute_candidates()),
+# `steps` the number of Newton rounds after the first.
+impute_request <- function(state, vars, maxit = 5, steps = 1, calibrate = FALSE, seed = 2024) {
+  res <- state$steps$summary$result
+  cand <- impute_candidates(res)
+  bad <- setdiff(vars, cand$Variable)
+  if (length(bad)) stop("These variables cannot be imputed: ", paste(bad, collapse = ", "))
+  if (!length(vars)) stop("Choose at least one variable to impute.")
+  # Predictors missing for everyone in some split cannot inform the models.
+  preds <- setdiff(unlist(res$predictors), unlist(res$all_missing))
+  list(kind = "impute_local", predictors = preds, levels = res$levels,
+       models = lapply(vars, function(v) list(var = v, family = cand$Family[cand$Variable == v])),
+       maxit = maxit, steps = steps, calibrate = calibrate, seed = seed,
+       min_count = if (is.null(state$config$min_count)) 0L else state$config$min_count)
+}
+
 rank_request <- function(state, method = "rf", ntree = 100, seed = 1234) {
   list(kind = "rank", predictors = state$steps$summary$result$predictors,
        method = method, ntree = ntree, seed = seed)
@@ -153,17 +195,23 @@ cut_request <- function(state, probs = DEFAULT_PROBS) {
 # Model fitting for the parsimony analysis (`models` = top 1..m variables,
 # evaluated on the validation sets) or the final score (one model, test sets).
 # ODAL2 starts from the lead site's own estimate, so it needs the lead's data.
-fit_request <- function(state, models, method = c("ODAL2", "dCLR"), refinements = 1, split = "validate",
-                        max_score = 100, lead_data = NULL) {
-  method <- match.arg(method)
+# `times` are the follow-up times for AUC(t) (survival, final score only).
+fit_request <- function(state, models, method, refinements = 1, split = "validate",
+                        max_score = 100, lead_data = NULL, times = NULL) {
+  outcome <- study_outcome(state)
+  if (!method %in% METHODS[[outcome]])
+    stop(sprintf("%s is not available for a %s outcome; choose %s.", method, outcome,
+                 paste(METHODS[[outcome]], collapse = " or ")))
   cutoffs <- state$steps$cut$result$cutoffs
   intercept <- method == "ODAL2"
   specs <- lapply(models, function(vars) list(vars = vars, terms = design_terms(cutoffs, vars, intercept)$column))
   min_count <- if (is.null(state$config$min_count)) 0L else state$config$min_count
-  base <- list(method = method, refinements = refinements, split = split, full = split == "test",
-               max_score = max_score, cutoffs = cutoffs, weights = as.list(study_weights(state)),
-               min_count = min_count)
-  if (method == "dCLR") return(c(list(kind = "local"), base, list(models = specs)))
+  base <- list(method = method, outcome = outcome, refinements = refinements, split = split,
+               full = split == "test", max_score = max_score, cutoffs = cutoffs,
+               weights = as.list(study_weights(state)), min_count = min_count,
+               times = if (length(times)) as.numeric(times))
+  if (method %in% c("dCLR", "ODACH")) return(c(list(kind = "local"), base, list(models = specs)))
+  if (method == "DiSAH") return(c(list(kind = "linying"), base, list(models = specs)))
   if (is.null(lead_data)) stop("ODAL2 needs the lead site's data to start.")
   specs <- lapply(specs, function(m) {
     check_min_count(lead_data, list(kind = "derivs", cutoffs = cutoffs, min_count = min_count), m$vars)
@@ -183,22 +231,35 @@ site_reply <- function(req, site, data) {
 
 reply_body <- function(req, data) {
   switch(req$kind,
-         summary = summary_reply(data),
+         summary = summary_reply(data, req),
+         impute_local = , impute_derivs = impute_reply(req, data),
          rank = list(ranking = names(site_rank(data, req$predictors, req$method, req$ntree, req$seed))),
          cut = list(stats = site_cut_stats(data$train, req$predictors, req$probs)),
-         local = , derivs = , surrogate = , evaluate =
+         local = , derivs = , surrogate = , linying = , evaluate =
            list(models = lapply(req$models, function(m) model_reply(req, m, data))),
          stop("Unknown request: ", req$kind))
 }
 
-summary_reply <- function(data) {
+summary_reply <- function(data, req = list()) {
+  outcome <- data_outcome(data$train)
+  if (!is.null(req$outcome) && outcome != req$outcome)
+    stop(sprintf("This study has a %s outcome, but your data has a %s outcome.", req$outcome, outcome))
   splits <- names(SPLIT_ALIASES)
-  for (s in splits)
-    if (length(unique(data[[s]]$label)) < 2) stop(sprintf("The %s set needs both outcome classes.", s))
-  preds <- setdiff(names(data$train), "label")
-  list(n = lapply(data[splits], nrow), events = lapply(data[splits], function(d) sum(d$label)),
-       predictors = lapply(setNames(preds, preds), function(v)
-         if (is.factor(data$train[[v]])) "categorical" else "numeric"))
+  for (s in splits) {
+    ev <- event_indicator(data[[s]])
+    if (length(unique(ev)) < 2)
+      stop(sprintf("The %s set needs both %s.", s, if (outcome == "survival") "events and censored patients" else "outcome classes"))
+  }
+  preds <- predictor_names(data$train)
+  all_rows <- do.call(rbind, lapply(data[splits], function(d) d[, preds, drop = FALSE]))
+  list(outcome = outcome, n = lapply(data[splits], nrow),
+       events = lapply(data[splits], function(d) sum(event_indicator(d))),
+       predictors = lapply(setNames(preds, preds), function(v) {
+         x <- all_rows[[v]]
+         if (is.factor(x)) list(type = "categorical", levels = levels(droplevels(x)))
+         else list(type = "numeric", binary = all(stats::na.omit(x) %in% c(0, 1)))
+       }),
+       missing = lapply(data[splits], function(d) as.list(colSums(is.na(d[, preds, drop = FALSE])))))
 }
 
 # Small-cell protection. Model statistics computed from very few patients
@@ -210,7 +271,7 @@ check_min_count <- function(data, req, vars) {
   k <- if (is.null(req$min_count)) 0 else req$min_count
   if (k <= 0) return(invisible())
   if (req$kind == "evaluate") {
-    y <- data[[req$split]]$label
+    y <- event_indicator(data[[req$split]])
     if (min(sum(y), sum(1 - y)) < k)
       stop(sprintf("The %s set has %d events and %d non-events; sharing its performance needs at least %d of each.",
                    req$split, sum(y), sum(1 - y), k))
@@ -223,7 +284,7 @@ check_min_count <- function(data, req, vars) {
     if (length(bad)) sprintf("%s %s (%d)", v, names(bad), as.integer(bad))
   }))
   if (length(small))
-    stop(sprintf("Too few patients to share statistics safely (minimum %d per category): %s. Merge these categories, or ask the lead site to change the cut-offs on step 3.",
+    stop(sprintf("Too few patients to share statistics safely (minimum %d per category): %s. Merge these categories, or ask the lead site to change the cut-offs on the Cut-offs step.",
                  k, paste(small, collapse = ", ")))
   invisible()
 }
@@ -233,14 +294,19 @@ model_reply <- function(req, m, data) {
   if (req$kind == "evaluate") {
     df <- data[[req$split]]
     score <- compute_scores(df, as.data.frame(m$table, stringsAsFactors = FALSE), req$cutoffs)
+    if (identical(req$outcome, "survival")) {
+      if (isTRUE(req$full)) return(evaluate_survival(score, df$label_time, df$label_status, unlist(req$times)))
+      return(list(n = nrow(df), auc = surv_iauc(score, df$label_time, df$label_status)))
+    }
     if (isTRUE(req$full)) return(list(metrics = evaluate_scores(score, df$label), roc = roc_points(score, df$label)))
     return(list(n = nrow(df), auc = auc_only(score, df$label)))
   }
   xy <- site_xy(data$train, req$cutoffs, m$vars, req$method == "ODAL2")
   out <- switch(req$kind,
-                local = dclr_local(xy$X, xy$y),
-                derivs = c(site_derivs(req$method, m$beta, xy$X, xy$y), list(n = length(xy$y))),
-                surrogate = dclr_surrogate(xy$X, xy$y, m$beta, list(grad = m$grad, hess = as.matrix(m$hess))))
+                local = local_fit(req$method, xy),
+                derivs = c(site_derivs(req$method, m$beta, xy), list(n = length(xy$y))),
+                surrogate = local_surrogate(req$method, xy, m$beta, list(grad = m$grad, hess = as.matrix(m$hess))),
+                linying = linying_stats(xy$X, xy$time, xy$y))
   lapply(out, function(x) if (is.numeric(x) && !is.matrix(x)) unname(x) else x)
 }
 
@@ -256,6 +322,7 @@ advance_step <- function(state, step, lead_data = NULL) {
   replies <- rounds[[k]]$replies[state$config$sites]
   out <- switch(step,
                 summary = summary_result(req, replies),
+                impute = advance_impute(req, replies),
                 rank = rank_result(replies, study_weights(state)),
                 cut = cut_result(replies, study_weights(state)),
                 pars = , final = advance_fit(req, replies, lead_data))
@@ -270,7 +337,7 @@ advance_step <- function(state, step, lead_data = NULL) {
 
 summary_result <- function(req, replies) {
   sites <- names(replies)
-  types <- lapply(replies, function(r) unlist(r$predictors))
+  types <- lapply(replies, function(r) vapply(r$predictors, function(p) p$type, ""))
   common <- Reduce(intersect, lapply(types, names))
   same_type <- vapply(common, function(v) length(unique(vapply(types, `[[`, "", v))) == 1, logical(1))
   warnings <- character(0)
@@ -296,7 +363,57 @@ summary_result <- function(req, replies) {
     `Event rate (train)` = sprintf("%.1f%%", 100 * ev / n),
     Weight = sprintf("%.2f", w),
     check.names = FALSE)
-  list(predictors = common, weighting = req$weighting, weights = as.list(w), table = table, warnings = warnings)
+  # Study-wide levels of categorical predictors, and which numeric ones are 0/1.
+  levels <- list()
+  binary <- list()
+  for (v in common) {
+    info <- lapply(replies, function(r) r$predictors[[v]])
+    if (info[[1]]$type == "categorical") levels[[v]] <- sort(unique(unlist(lapply(info, `[[`, "levels"))))
+    else binary[[v]] <- all(vapply(info, function(x) isTRUE(x$binary), logical(1)))
+  }
+  # Missing values: percentage per site and variable (all splits together).
+  splits <- names(SPLIT_ALIASES)
+  miss <- vapply(sites, function(s) {
+    r <- replies[[s]]
+    n_all <- sum(vapply(splits, function(sp) as.numeric(r$n[[sp]]), numeric(1)))
+    vapply(common, function(v) sum(vapply(splits, function(sp) as.numeric(r$missing[[sp]][[v]]), numeric(1))) / n_all, numeric(1))
+  }, numeric(length(common)))
+  miss <- matrix(miss, nrow = length(common), dimnames = list(common, sites))
+  # Variables missing for every patient of some split cannot be imputed or
+  # used to impute others.
+  all_missing <- common[vapply(common, function(v) any(vapply(sites, function(s) any(vapply(splits, function(sp)
+    as.numeric(replies[[s]]$missing[[sp]][[v]]) == as.numeric(replies[[s]]$n[[sp]]) &&
+      as.numeric(replies[[s]]$n[[sp]]) > 0, logical(1))), logical(1))), logical(1))]
+  missing <- data.frame(Variable = common, round(100 * miss, 1), check.names = FALSE)
+  names(missing)[-1] <- paste("% missing at", sites)
+  missing <- missing[rowSums(miss) > 0, , drop = FALSE]
+  list(outcome = req$outcome, predictors = common, weighting = req$weighting, weights = as.list(w), table = table,
+       warnings = warnings, levels = levels, binary = binary, missing = missing, all_missing = all_missing)
+}
+
+# Variables with missing values that FedIMPUTE can impute, and their family.
+impute_candidates <- function(summary) {
+  if (!length(unlist(summary$missing$Variable))) return(data.frame(Variable = character(0), Family = character(0)))
+  miss <- as_df(summary$missing)
+  vars <- setdiff(miss$Variable, unlist(summary$all_missing))
+  fam <- vapply(vars, function(v) {
+    lv <- summary$levels[[v]]
+    impute_family(if (is.null(lv)) "numeric" else "categorical", summary$binary[[v]], lv)
+  }, "")
+  out <- data.frame(Variable = vars, Family = unname(fam), stringsAsFactors = FALSE)
+  out[!is.na(out$Family), , drop = FALSE]
+}
+
+# FedIMPUTE rounds: impute_local -> impute_derivs (x steps) -> result.
+advance_impute <- function(req, replies) {
+  coefs <- lapply(seq_along(req$models), function(m) impute_combine(req, replies, m))
+  models <- Map(function(m, b) c(m[c("var", "family")], list(coef = unname(b))), req$models, coefs)
+  pass <- if (req$kind == "impute_local") 0L else req$pass
+  base <- req[c("predictors", "levels", "maxit", "steps", "calibrate", "seed", "min_count")]
+  if (pass < req$steps) return(c(list(kind = "impute_derivs", pass = pass + 1L), base, list(models = models)))
+  n <- lapply(seq_along(req$models), function(m) vapply(replies, function(r) as.numeric(r$models[[m]]$n), numeric(1)))
+  models <- Map(function(m, k) c(m, list(n = as.list(k))), models, n)
+  c(base[c("predictors", "levels", "maxit", "calibrate", "seed")], list(models = models))
 }
 
 rank_result <- function(replies, weights) {
@@ -309,8 +426,9 @@ cut_result <- function(replies, weights) {
   list(cutoffs = cutoffs, auto = cutoffs)
 }
 
-# The fitting rounds. ODAL2: derivs -> (lead fits) -> evaluate. dCLR: local ->
-# derivs -> surrogate (-> derivs -> surrogate ...) -> evaluate.
+# The fitting rounds. ODAL2: derivs -> (lead fits) -> evaluate. dCLR and
+# ODACH: local -> derivs -> surrogate (-> derivs -> surrogate ...) -> evaluate.
+# DiSAH: linying -> evaluate.
 advance_fit <- function(req, replies, lead_data) {
   w <- unlist(req$weights)[names(replies)]
   M <- length(req$models)
@@ -327,8 +445,8 @@ advance_fit <- function(req, replies, lead_data) {
     })
     list(kind = "evaluate", models = models)
   }
-  carry <- function(x) c(x, req[intersect(c("method", "refinements", "split", "full", "max_score", "cutoffs",
-                                            "weights", "min_count"), names(req))])
+  carry <- function(x) c(x, req[intersect(c("method", "outcome", "refinements", "split", "full", "max_score",
+                                            "cutoffs", "weights", "min_count", "times"), names(req))])
 
   switch(req$kind,
     local = carry(list(kind = "derivs", pass = 1L, models = lapply(seq_len(M), function(m) {
@@ -368,19 +486,25 @@ advance_fit <- function(req, replies, lead_data) {
           keep(m, beta = ests[[m]]$beta, se = ests[[m]]$se, converged = ests[[m]]$converged))))
       }
     },
+    linying = carry(evaluate(lapply(seq_len(M), function(m) {
+      fit <- linying_combine(answers(m))
+      keep(m, beta = unname(fit$beta), se = unname(fit$se), converged = TRUE)
+    }))),
     evaluate = fit_result(req, replies, w),
     stop("Unknown request: ", req$kind))
 }
 
 fit_result <- function(req, replies, w) {
   sites <- names(replies)
-  base <- req[c("method", "refinements", "max_score", "cutoffs")]
+  base <- req[intersect(c("method", "outcome", "refinements", "max_score", "cutoffs", "times"), names(req))]
   if (isTRUE(req$full)) {
     m <- req$models[[1]]
     perf <- do.call(rbind, lapply(sites, function(s)
       cbind(Site = s, as.data.frame(replies[[s]]$models[[1]]$metrics), stringsAsFactors = FALSE)))
-    return(c(base, m[c("vars", "terms", "beta", "se", "init", "converged", "table")],
-             list(perf = perf, roc = lapply(replies, function(r) r$models[[1]]$roc))))
+    curves <- if (identical(req$outcome, "survival")) list(auc_t = lapply(replies, function(r) r$models[[1]]$auc_t))
+              else list(roc = lapply(replies, function(r) r$models[[1]]$roc))
+    return(c(base, m[intersect(c("vars", "terms", "beta", "se", "init", "converged", "table"), names(m))],
+             list(perf = perf), curves))
   }
   auc <- do.call(rbind, lapply(seq_along(req$models), function(m) {
     vars <- req$models[[m]]$vars

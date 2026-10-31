@@ -8,9 +8,10 @@ study_state <- function(store, study) parse_study(store_snapshot(store, study), 
 
 # `site` answers its open request, if any. Returns TRUE if it wrote a reply.
 respond_as <- function(store, study, site, data) {
-  t <- site_task(study_state(store, study), site)
+  st <- study_state(store, study)
+  t <- site_task(st, site)
   if (is.null(t)) return(FALSE)
-  store$write(round_file(study, t$step, t$round, site), site_reply(t$request, site, data))
+  store$write(round_file(study, t$step, t$round, site), site_reply(t$request, site, step_data(st, t$step, data)))
   TRUE
 }
 
@@ -22,7 +23,7 @@ finish_step <- function(store, study, sites, lead) {
     lt <- lead_task(st)
     if (is.null(lt)) return(invisible(st))
     if (!lt$ready) stop("Step cannot continue: ", paste(c(lt$missing, lt$errors), collapse = "; "))
-    out <- advance_step(st, lt$step, sites[[lead]])
+    out <- advance_step(st, lt$step, step_data(st, lt$step, sites[[lead]]))
     store$write(out$path, out$obj)
   }
 }
@@ -53,9 +54,25 @@ fit_pooled_pairwise <- function(Xs, ys, weights, ridge = 1e-6) {
   setNames(newton_max(f, rep(0, ncol(Xs[[1]])))$beta, colnames(Xs[[1]]))
 }
 
+# Pooled stratified fits for the survival models: coxph with strata(site)
+# (Breslow ties) for ODACH, and the Lin-Ying estimator summed over sites
+# (computed with the DiSAH reference loops in test-engine.R) for DiSAH.
+fit_pooled_cox <- function(xy) {
+  X <- do.call(rbind, lapply(xy, `[[`, "X"))
+  site <- rep(seq_along(xy), vapply(xy, function(z) nrow(z$X), numeric(1)))
+  strata <- survival::strata   # coxph recognises the term by the bare name "strata"
+  fit <- survival::coxph(survival::Surv(unlist(lapply(xy, `[[`, "time")), unlist(lapply(xy, `[[`, "y"))) ~
+                           X + strata(site), ties = "breslow")
+  setNames(unname(stats::coef(fit)), colnames(X))
+}
+
 pooled_fit <- function(sites, cutoffs, vars, method, weights) {
   xy <- lapply(sites, function(s) site_xy(s$train, cutoffs, vars, method == "ODAL2"))
   Xs <- lapply(xy, `[[`, "X")
   ys <- lapply(xy, `[[`, "y")
-  if (method == "ODAL2") fit_pooled_logistic(Xs, ys) else fit_pooled_pairwise(Xs, ys, weights[names(sites)])
+  switch(method,
+         ODAL2 = fit_pooled_logistic(Xs, ys),
+         dCLR = fit_pooled_pairwise(Xs, ys, weights[names(sites)]),
+         ODACH = fit_pooled_cox(xy),
+         DiSAH = setNames(linying_combine(lapply(xy, function(z) linying_stats(z$X, z$time, z$y)))$beta, colnames(Xs[[1]])))
 }

@@ -200,3 +200,96 @@ test_that("sites refuse to share statistics about very small groups", {
   expect_silent(check_min_count(few, list(kind = "evaluate", split = "test", min_count = 0), "x1"))
   expect_error(create_study(store, "st3", "A", c("A", "B"), min_count = -1), "at least 0")
 })
+
+# Survival sites with site-specific baseline hazards.
+sim_surv_site <- function(n, rate, seed, beta = c(0.8, -0.6, 0.4)) {
+  set.seed(seed)
+  make <- function(n) {
+    X <- matrix(rbinom(n * 3, 1, 0.4), n, 3)
+    time <- round(rexp(n, rate * exp(drop(X %*% beta))), 1)
+    cens <- runif(n, 0, quantile(time, 0.9))
+    data.frame(x1 = factor(X[, 1]), x2 = factor(X[, 2]), x3 = factor(X[, 3]), age = round(runif(n, 20, 90)),
+               label_time = pmin(time, cens), label_status = as.integer(time <= cens))
+  }
+  normalize_site_data(list(train = make(n), validate = make(n / 2), test = make(n / 2)))
+}
+
+for (method in c("ODACH", "DiSAH")) {
+  test_that(sprintf("a full %s survival study through the store matches the pooled stratified fit", method), {
+    sites <- list(A = sim_surv_site(2000, 0.05, 21), B = sim_surv_site(1200, 0.2, 22))
+    store <- folder_store(tempfile("store"))
+    create_study(store, "st", "A", names(sites), outcome = "survival")
+    st <- finish_step(store, "st", sites, "A")
+    expect_equal(st$steps$summary$result$outcome, "survival")
+    expect_error(fit_request(st, list("x1"), "ODAL2"), "not available for a survival outcome")
+    st <- run_step(store, "st", sites, "A", "rank", function(st) rank_request(st, "rf", 10))
+    st <- run_step(store, "st", sites, "A", "cut", cut_request)
+    vars <- c("x1", "x2", "x3")
+    passes <- if (method == "ODACH") 3 else 1
+    st <- run_step(store, "st", sites, "A", "pars", function(st)
+      fit_request(st, list("x1", c("x1", "x2"), vars), method, passes))
+    expect_true(all(as_df(st$steps$pars$result$summary)$AUC > 0.5))
+    st <- run_step(store, "st", sites, "A", "final", function(st)
+      fit_request(st, list(vars), method, passes, "test", 100, times = c(2, 5, 10)))
+    fin <- st$steps$final$result
+    expect_length(st$steps$final$rounds, if (method == "ODACH") 2 + 2 * passes else 2)
+    pooled <- pooled_fit(sites, fin$cutoffs, vars, method, study_weights(st))
+    expect_lt(max(abs(fin$beta - pooled)), if (method == "ODACH") 1e-3 else 1e-10)
+    if (method == "ODACH") expect_lt(max(abs(fin$beta - c(0.8, -0.6, 0.4))), 0.2)
+    perf <- as_df(fin$perf)
+    expect_equal(perf$Site, c("A", "B"))
+    expect_true(all(perf$C_index > 0.55 & perf$iAUC > 0.55))
+    expect_equal(unlist(fin$auc_t$A$time), c(2, 5, 10)[c(2, 5, 10) < max(sites$A$test$label_time)])
+    if (method == "ODACH") {
+      tl <- fit_tlscore(setNames(fin$beta, fin$terms), method, fin$vars, sites$B, fin$cutoffs)
+      expect_equal(nrow(tl$table), nrow(as_df(fin$table)))
+    } else {
+      expect_error(fit_tlscore(setNames(fin$beta, fin$terms), method, fin$vars, sites$B, fin$cutoffs), "not available")
+    }
+  })
+}
+
+test_that("a site whose outcome does not match the study replies with an error", {
+  sites <- list(A = sim_site(400, -1, 31), B = sim_surv_site(400, 0.1, 32))
+  store <- folder_store(tempfile("store"))
+  create_study(store, "st", "A", names(sites), outcome = "binary")
+  respond_as(store, "st", "A", sites$A)
+  respond_as(store, "st", "B", sites$B)
+  expect_match(lead_task(study_state(store, "st"))$errors[["B"]], "binary outcome, but your data has a survival outcome")
+})
+
+test_that("FedIMPUTE fills missing values before the rest of the study", {
+  sites <- list(A = sim_site(1500, -1, 41), B = sim_site(1000, -0.5, 42))
+  set.seed(43)
+  for (s in names(sites)) for (sp in names(sites[[s]])) {
+    d <- sites[[s]][[sp]]
+    d$age[runif(nrow(d)) < if (s == "A") 0.2 else 0.05] <- NA
+    d$x2[runif(nrow(d)) < 0.1] <- NA
+    sites[[s]][[sp]] <- d
+  }
+  store <- folder_store(tempfile("store"))
+  create_study(store, "st", "A", names(sites))
+  st <- finish_step(store, "st", sites, "A")
+  cand <- impute_candidates(st$steps$summary$result)
+  expect_equal(cand$Family[match(c("age", "x2"), cand$Variable)], c("gaussian", "binomial"))
+  expect_true(all(as_df(st$steps$summary$result$missing)[["% missing at A"]] > 0))
+  st <- run_step(store, "st", sites, "A", "impute", function(st) impute_request(st, c("age", "x2"), steps = 2))
+  expect_length(st$steps$impute$rounds, 3)          # local, then 2 Newton rounds
+  res <- st$steps$impute$result
+  done <- lapply(sites, function(d) step_data(st, "rank", d))
+  expect_false(anyNA(done$A$train$age) || anyNA(done$B$test$x2))
+  expect_identical(levels(done$A$train$x2), levels(sites$A$train$x2))
+  # The age model is linear, so a Newton round gives the pooled least-squares fit.
+  m <- res$models[[which(vapply(res$models, `[[`, "", "var") == "age")]]
+  rows <- lapply(sites, function(d) impute_rows(d$train, local_fill(d$train[, unlist(res$predictors)], 5, 2024),
+                                                m, list(predictors = unlist(res$predictors), levels = res$levels)))
+  X <- do.call(rbind, lapply(rows, `[[`, "X")); y <- unlist(lapply(rows, `[[`, "y"))
+  expect_equal(unname(m$coef), unname(drop(solve(crossprod(X), crossprod(X, y)))), tolerance = 1e-6)
+  # The rest of the study uses the completed data: no "Unknown" category.
+  st <- run_step(store, "st", sites, "A", "rank", function(st) rank_request(st, "rf", 10))
+  st <- run_step(store, "st", sites, "A", "cut", cut_request)
+  expect_false(st$steps$cut$result$cutoffs$age$has_na)
+  # Re-running the imputation clears the later steps.
+  start_step(store, "st", names(store_snapshot(store, "st")), "impute", impute_request(study_state(store, "st"), "age"), "A")
+  expect_null(study_state(store, "st")$steps$cut$result)
+})

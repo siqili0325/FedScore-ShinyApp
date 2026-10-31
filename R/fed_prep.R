@@ -12,17 +12,22 @@ site_weights <- function(n, scheme = c("size", "equal")) {
 # Module 1 --------------------------------------------------------------------
 
 # Variable importance at one site (AutoScore Module 1). Returns a named vector,
-# most important first.
+# most important first. Binary outcomes: random forest or univariable AUC.
+# Survival outcomes: random survival forest (AutoScore-Survival).
 site_rank <- function(site, predictors, method = c("rf", "auc"), ntree = 100, seed = 1234) {
   method <- match.arg(method)
   set.seed(seed)
-  train <- site$train[, c(predictors, "label")]
-  validate <- if (method == "auc") site$validate[, c(predictors, "label")] else NULL
-  # AutoScore_rank prints and draws a plot; keep both out of the Shiny session.
+  survival <- data_outcome(site$train) == "survival"
+  if (survival && method == "auc") stop("Univariable AUC ranking is only available for binary outcomes.")
+  outcome <- if (survival) c("label_time", "label_status") else "label"
+  train <- site$train[, c(predictors, outcome)]
+  validate <- if (method == "auc") site$validate[, c(predictors, outcome)] else NULL
+  # AutoScore's ranking prints and draws a plot; keep both out of the Shiny session.
   grDevices::pdf(NULL)
   on.exit(grDevices::dev.off(), add = TRUE)
   utils::capture.output(
-    imp <- AutoScore::AutoScore_rank(train, validation_set = validate, method = method, ntree = ntree)
+    imp <- if (survival) AutoScore::AutoScore_rank_Survival(train, ntree = ntree) else
+      AutoScore::AutoScore_rank(train, validation_set = validate, method = method, ntree = ntree)
   )
   imp
 }

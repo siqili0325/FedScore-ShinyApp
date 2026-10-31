@@ -24,7 +24,7 @@ jobs:
       - name: Install packages
         run: |
           install.packages(c("shiny", "bslib", "ggplot2", "AutoScore", "pROC", "glmnet",
-                             "jsonlite", "httr2", "testthat"))
+                             "jsonlite", "mice", "digest", "httr2", "testthat"))
         shell: Rscript {0}
 
       - name: Run tests

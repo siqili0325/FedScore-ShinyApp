@@ -86,7 +86,7 @@ test_that("surrogate fits with exact aggregated derivatives reach the pooled opt
   # ODAL2 iterated to a fixed point is the size-weighted pooled MLE.
   bb <- odal2_init(Xs$A, ys$A)
   for (i in 1:5) {
-    total <- aggregate_derivs(Map(function(X, y) site_derivs("ODAL2", bb, X, y), Xs, ys), w)
+    total <- aggregate_derivs(Map(function(X, y) site_derivs("ODAL2", bb, list(X = X, y = y)), Xs, ys), w)
     bb <- odal2_surrogate(Xs$A, ys$A, bb, total, N = 4500)$beta
   }
   expect_equal(unname(bb), unname(fit_pooled_logistic(Xs, ys)), tolerance = 1e-5)
@@ -136,6 +136,16 @@ test_that("site data in all supported layouts is normalised", {
   expect_equal(nrow(s2$test), 50)
   expect_error(normalize_site_data(list(train = df)), "validate")
   expect_equal(as_binary_label(factor(c("No", "Yes", "No"), levels = c("No", "Yes"))), c(0L, 1L, 0L))
+  expect_equal(attr(s, "outcome"), "binary")
+  surv <- data.frame(a = 1:40, label_time = c(0, 1:39), label_status = rep(c(TRUE, FALSE), 20))
+  s3 <- normalize_site_data(list(train = surv, validate = surv, test = surv))
+  expect_equal(attr(s3, "outcome"), "survival")
+  expect_identical(s3$train$label_status, rep(c(1L, 0L), 20))
+  expect_equal(predictor_names(s3$train), "a")
+  bad <- surv
+  bad$label_time[3] <- -1
+  expect_error(normalize_site_data(list(train = bad, validate = surv, test = surv)), "negative")
+  expect_error(normalize_site_data(list(train = surv, validate = df, test = surv)), "same outcome")
 })
 
 test_that("cut-offs at a site's minimum or maximum are dropped (no empty categories)", {
@@ -146,4 +156,117 @@ test_that("cut-offs at a site's minimum or maximum are dropped (no empty categor
   expect_gt(min(cuts$k$cuts), 0)
   tab <- table(categorize(rbind(s1, s2), cuts)$k)
   expect_true(all(tab > 0))
+})
+
+# Survival models ---------------------------------------------------------------
+
+sim_surv <- function(n, beta, seed, rate = 0.1) {
+  set.seed(seed)
+  X <- cbind(a = rbinom(n, 1, 0.4), b = rbinom(n, 1, 0.5), c = rbinom(n, 1, 0.3))
+  time <- round(rexp(n, rate * exp(drop(X %*% beta))), 1)       # rounding creates ties
+  list(X = X, time = time, y = rbinom(n, 1, 0.75))
+}
+
+test_that("the Cox partial likelihood matches survival::coxph (Breslow ties)", {
+  d <- sim_surv(400, c(0.7, -0.4, 0.3), 1)
+  fit <- cox_mle(d$X, d$time, d$y, ridge = 0)
+  ref <- survival::coxph(survival::Surv(d$time, d$y) ~ d$X, ties = "breslow")
+  expect_equal(unname(fit$beta), unname(coef(ref)), tolerance = 1e-8)
+  expect_equal(fit$value * 400, ref$loglik[2], tolerance = 1e-8)
+  expect_equal(unname(safe_inv(-400 * fit$hess)), unname(vcov(ref)), tolerance = 1e-8)
+  b <- c(0.2, -0.1, 0.4)
+  an <- cox_lik(b, d$X, d$time, d$y, TRUE, 0)
+  fd <- sapply(1:3, function(k) {
+    e <- replace(numeric(3), k, 1e-6)
+    (cox_lik(b + e, d$X, d$time, d$y, TRUE, 0)$grad - cox_lik(b - e, d$X, d$time, d$y, TRUE, 0)$grad) / 2e-6
+  })
+  expect_equal(unname(an$hess), unname(fd), tolerance = 1e-6)
+})
+
+# Line-by-line port of V_k() from the DiSAH code (fun.R), without tidyverse.
+disah_V_k <- function(yobs, delta, X) {
+  N <- length(yobs); p <- ncol(X)
+  y_sort <- sort(yobs); y_rank <- rank(yobs, ties.method = "min")
+  X_bar <- matrix(0, N, p)
+  for (j in 1:N) { Y <- as.numeric(yobs >= y_sort[j]); X_bar[j, ] <- colSums(X * Y) / sum(Y) }
+  dd <- diff(c(0, y_sort))
+  A0 <- B0 <- matrix(0, p, p); d0 <- rep(0, p)
+  for (i in 1:N) {
+    Ki <- y_rank[i]
+    Ri <- matrix(rep(X[i, ], Ki), nrow = Ki, byrow = TRUE) - X_bar[1:Ki, , drop = FALSE]
+    Rdi <- Ri * sqrt(dd[1:Ki])
+    A0 <- A0 + t(Rdi) %*% Rdi
+    d0 <- d0 + (X[i, ] - X_bar[y_rank[i], ]) * delta[i]
+    B0 <- B0 + delta[i] * (Ri[Ki, ] %*% t(Ri[Ki, ]))
+  }
+  list(A = A0, d = d0, B = B0)
+}
+
+test_that("the additive-hazards sums match the DiSAH reference code", {
+  d <- sim_surv(250, c(0.7, -0.4, 0.3), 2)
+  ref <- disah_V_k(d$time, d$y, d$X)
+  got <- linying_stats(d$X, d$time, d$y)
+  expect_equal(unname(got$A), unname(ref$A), tolerance = 1e-10)
+  expect_equal(unname(got$d), unname(ref$d), tolerance = 1e-10)
+  expect_equal(unname(got$B), unname(ref$B), tolerance = 1e-10)
+  # Combining two sites equals solving the summed (stratified) equations.
+  e <- sim_surv(150, c(0.7, -0.4, 0.3), 3)
+  ref2 <- disah_V_k(e$time, e$y, e$X)
+  fit <- linying_combine(list(got, linying_stats(e$X, e$time, e$y)))
+  expect_equal(unname(fit$beta), unname(drop(solve(ref$A + ref2$A, ref$d + ref2$d))), tolerance = 1e-10)
+  expect_true(all(fit$se > 0))
+})
+
+test_that("survival metrics match AutoScore-Survival", {
+  set.seed(4)
+  n <- 500
+  status <- rbinom(n, 1, 0.7)
+  time <- round(rexp(n, 0.05), 1) + 0.1
+  score <- rnorm(n) - time / 20
+  r <- evaluate_survival(score, time, status, c(5, 10, 20))
+  val <- data.frame(label_time = time, label_status = status)
+  expect_equal(r$metrics$iAUC, AutoScore:::eva_performance_iauc(score, val, print = FALSE), tolerance = 1e-12)
+  ref_c <- survival::concordancefit(survival::Surv(time, status), -score)$concordance
+  expect_equal(r$metrics$C_index, unname(ref_c))
+  expect_gt(r$metrics$C_index, 0.6)
+  expect_length(r$auc_t$auc, 3)
+})
+
+# Imputation ----------------------------------------------------------------------
+
+test_that("one Newton round from the local average gives the pooled linear imputation model", {
+  set.seed(5)
+  make <- function(n, shift) {
+    d <- data.frame(x1 = rnorm(n, shift), x2 = rnorm(n), g = factor(sample(c("a", "b", "c"), n, TRUE)))
+    d$x3 <- 1 + 0.5 * d$x1 - d$x2 + (d$g == "b") + rnorm(n, sd = 0.5)
+    d$x3[runif(n) < 0.3] <- NA
+    d$x1[runif(n) < 0.1] <- NA
+    d
+  }
+  sites <- list(A = make(400, 0), B = make(300, 1))
+  levels <- list(g = c("a", "b", "c"))
+  preds <- c("x1", "x2", "g", "x3")
+  req <- list(kind = "impute_local", predictors = preds, levels = levels, maxit = 2, seed = 1, min_count = 10,
+              models = list(list(var = "x3", family = "gaussian")))
+  r1 <- lapply(sites, function(d) impute_reply(req, list(train = d)))
+  b0 <- impute_combine(req, r1, 1)
+  req2 <- req
+  req2$kind <- "impute_derivs"
+  req2$models <- list(list(var = "x3", family = "gaussian", coef = b0))
+  r2 <- lapply(sites, function(d) impute_reply(req2, list(train = d)))
+  b1 <- impute_combine(req2, r2, 1)
+  # Pooled least squares on the same (locally completed) inputs.
+  rows <- lapply(sites, function(d) impute_rows(d, local_fill(d[, preds], 2, 1), req$models[[1]], req))
+  X <- do.call(rbind, lapply(rows, `[[`, "X")); y <- unlist(lapply(rows, `[[`, "y"))
+  expect_equal(unname(b1), unname(drop(solve(crossprod(X), crossprod(X, y)))), tolerance = 1e-6)
+
+  res <- list(predictors = preds, levels = levels, maxit = 2, seed = 1, calibrate = FALSE,
+              models = list(list(var = "x3", family = "gaussian", coef = b1)))
+  data <- list(train = sites$A, validate = sites$A, test = sites$B)
+  out <- apply_imputation(data, res)
+  expect_false(anyNA(out$train$x3))
+  expect_true(anyNA(out$train$x1))                     # not chosen for imputation: left as is
+  expect_equal(out$train$x3[!is.na(sites$A$x3)], sites$A$x3[!is.na(sites$A$x3)])
+  expect_equal(attr(out, "imputed")$train$x3, sum(is.na(sites$A$x3)))
+  expect_identical(apply_imputation(data, res)$test$x3, out$test$x3)   # deterministic
 })
