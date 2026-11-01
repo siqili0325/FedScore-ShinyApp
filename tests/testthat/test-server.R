@@ -5,7 +5,7 @@ render_ok <- function(output, ids) {
   for (id in ids) testthat::expect_no_error(output[[id]], message = id)
 }
 
-for (alg in c("ODAL2", "dCLR")) {
+for (alg in "dCLR") {
   test_that(sprintf("the lead site's app runs a whole %s study", alg), {
     root <- tempfile("store")
     site2 <- read_site_file(file.path(app_dir, "data", "site2.rds"))
@@ -178,7 +178,7 @@ test_that("the lead site's app imputes missing values with FedIMPUTE first", {
     session$setInputs(quantiles = "0.05, 0.2, 0.8, 0.95", start_cut = 1)
     sync("cut")
     expect_false(results$cut$cutoffs$Lab_H$has_na)
-    session$setInputs(method = "ODAL2", refine = 1, var_mode = "top", n_vars = 4, max_score = 100, start_final = 1)
+    session$setInputs(method = "dCLR", refine = 1, var_mode = "top", n_vars = 4, max_score = 100, start_final = 1)
     sync("final")
     expect_true(all(as_df(results$final$perf)$AUC > 0.75))
   }))

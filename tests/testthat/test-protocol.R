@@ -89,7 +89,7 @@ test_that("the GitHub store lists, reads, writes, retries on conflicts and delet
   expect_error(github_store("not a repo"), "owner/name")
 })
 
-for (method in c("ODAL2", "dCLR")) {
+for (method in "dCLR") {
   test_that(sprintf("a full %s study through the store matches the pooled fit", method), {
     sites <- list(A = sim_site(3000, -2, 4), B = sim_site(1500, -0.5, 5), C = sim_site(1000, -1, 6))
     store <- folder_store(tempfile("store"))
@@ -109,21 +109,21 @@ for (method in c("ODAL2", "dCLR")) {
     vars <- c("x1", "x2", "x3")
     passes <- if (method == "dCLR") 3 else 1
     st <- run_step(store, "st", sites, "A", "pars", function(st)
-      fit_request(st, list("x1", c("x1", "x2"), vars), method, passes, lead_data = sites$A))
+      fit_request(st, list("x1", c("x1", "x2"), vars), method, passes))
     pars <- st$steps$pars$result
     expect_equal(nrow(as_df(pars$auc)), 9)
     expect_equal(as_df(pars$summary)$Model, 1:3)
 
     st <- run_step(store, "st", sites, "A", "final", function(st)
-      fit_request(st, list(vars), method, passes, "test", 100, sites$A))
+      fit_request(st, list(vars), method, passes, "test", 100))
     fin <- st$steps$final$result
     expect_true(fin$converged)
-    # Rounds: ODAL2 = derivs + evaluate; dCLR = local + passes * (derivs + surrogate) + evaluate.
-    expect_length(st$steps$final$rounds, if (method == "ODAL2") 2 else 2 + 2 * passes)
+    # Rounds: local, then passes * (derivs + surrogate), then evaluate.
+    expect_length(st$steps$final$rounds, 2 + 2 * passes)
     pooled <- pooled_fit(sites, cutoffs, vars, method, w)
     expect_equal(fin$terms, names(pooled))
-    expect_lt(max(abs(fin$beta - pooled)), if (method == "ODAL2") 0.02 else 1e-3)
-    expect_lt(max(abs(fin$beta[fin$terms != "(Intercept)"] - c(1, -0.8, 0.5))), 0.3)
+    expect_lt(max(abs(fin$beta - pooled)), 1e-3)
+    expect_lt(max(abs(fin$beta - c(1, -0.8, 0.5))), 0.3)
     expect_true(all(fin$se > 0))
     perf <- as_df(fin$perf)
     expect_equal(perf$Site, names(sites))
@@ -221,7 +221,7 @@ for (method in c("ODACH", "DiSAH")) {
     create_study(store, "st", "A", names(sites), outcome = "survival")
     st <- finish_step(store, "st", sites, "A")
     expect_equal(st$steps$summary$result$outcome, "survival")
-    expect_error(fit_request(st, list("x1"), "ODAL2"), "not available for a survival outcome")
+    expect_error(fit_request(st, list("x1"), "dCLR"), "not available for a survival outcome")
     st <- run_step(store, "st", sites, "A", "rank", function(st) rank_request(st, "rf", 10))
     st <- run_step(store, "st", sites, "A", "cut", cut_request)
     vars <- c("x1", "x2", "x3")
