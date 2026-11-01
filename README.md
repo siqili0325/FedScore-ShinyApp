@@ -6,9 +6,9 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: GPL-3" src="https://img.shields.io/badge/license-GPL--3-blue.svg"></a>
-  <img alt="R >= 4.1" src="https://img.shields.io/badge/R-%E2%89%A5%204.1-276DC3.svg">
-  <a href="../../actions/workflows/tests.yaml"><img alt="Tests" src="../../actions/workflows/tests.yaml/badge.svg"></a>
+  <a href="https://github.com/siqili0325/FedScore-ShinyApp/blob/main/LICENSE"><img alt="License GPL-3" src="https://img.shields.io/badge/license-GPL--3-blue.svg"></a>
+  <img alt="R 4.1 or later" src="https://img.shields.io/badge/R-4.1%2B-276DC3.svg">
+  <a href="https://github.com/siqili0325/FedScore-ShinyApp/actions/workflows/tests.yaml"><img alt="Tests" src="https://github.com/siqili0325/FedScore-ShinyApp/actions/workflows/tests.yaml/badge.svg"></a>
   <a href="https://doi.org/10.1016/j.jbi.2023.104485"><img alt="FedScore paper" src="https://img.shields.io/badge/paper-JBI%202023-orange.svg"></a>
 </p>
 
