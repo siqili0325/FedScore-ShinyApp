@@ -369,7 +369,7 @@ server <- function(input, output, session) {
   })
 
   output$whoami <- renderText({
-    if (is.null(rv$store)) return("Not connected")
+    if (is.null(rv$store)) return("Not connected yet: fill in Exchange store and click Connect")
     sprintf("%s%s - %s", rv$me, if (is_lead()) " (lead)" else "", rv$study)
   })
 
@@ -468,6 +468,7 @@ server <- function(input, output, session) {
         p(sprintf("There is no study called '%s' in %s yet. Create it, and your site (%s) becomes its lead site.",
                   rv$study, rv$store$label, rv$me)),
         textInput("sites", "Sites taking part (comma separated, including yours)", value = rv$me, width = "100%"),
+        helpText(sprintf("Add the other sites' names, exactly as they enter them as 'Your site name', e.g. %s, site2.", rv$me)),
         radioButtons("outcome", "Outcome", c("Binary" = "binary", "Survival (time to event)" = "survival"),
                      selected = if (is.null(rv$data)) "binary" else data_outcome(rv$data$train), inline = TRUE),
         radioButtons("weighting", "Site weights", c("Proportional to training size" = "size", "Equal" = "equal"), inline = TRUE),
@@ -511,6 +512,7 @@ server <- function(input, output, session) {
     sites <- unique(trimws(strsplit(input$sites, ",")[[1]]))
     sites <- sites[nzchar(sites)]
     guard(rv$me %in% sites, "Include your own site in the list.")
+    guard(length(sites) >= 2, "List every site taking part, separated by commas (e.g. site1, site2). A study needs at least two sites.")
     ok <- run_safely({
       create_study(rv$store, rv$study, rv$me, sites, input$weighting, input$min_count, input$outcome)
       TRUE
